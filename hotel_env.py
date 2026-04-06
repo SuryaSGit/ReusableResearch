@@ -216,13 +216,15 @@ class HotelEnv(gym.Env):
         self.action_space = spaces.Discrete(2)   # 0=Reject  1=Accept
 
         # Mutable state – initialised properly in reset()
-        self._rooms_occupied : int   = 0
-        self._time_step      : int   = 0
-        self._episode_revenue: float = 0.0
-        self._accepted       : int   = 0
-        self._rejected       : int   = 0
-        self._customer_type  : int   = 0
-        self._request        : int   = 1
+        self._rooms_occupied   : int   = 0
+        self._time_step        : int   = 0
+        self._episode_revenue  : float = 0.0
+        self._accepted         : int   = 0
+        self._rejected         : int   = 0
+        self._forced_reject    : int   = 0   # wanted to accept, no capacity
+        self._voluntary_reject : int   = 0   # agent chose to reject (action=0)
+        self._customer_type    : int   = 0
+        self._request          : int   = 1
 
         # Full episode history for backtracking & ideal-reward computation
         self._history: List[StepRecord] = []
@@ -244,6 +246,8 @@ class HotelEnv(gym.Env):
         self._episode_revenue = 0.0
         self._accepted        = 0
         self._rejected        = 0
+        self._forced_reject   = 0
+        self._voluntary_reject= 0
         self._history         = []
 
         self._sample_customer()
@@ -275,9 +279,11 @@ class HotelEnv(gym.Env):
                 self._episode_revenue += reward
                 self._accepted        += 1
             else:
-                self._rejected += 1              # over capacity → forced reject
+                self._rejected       += 1
+                self._forced_reject  += 1        # wanted to accept, hotel full
         else:
-            self._rejected += 1                  # voluntary reject
+            self._rejected        += 1
+            self._voluntary_reject += 1          # agent chose to reject
 
         rec.reward = reward
         self._history.append(rec)
@@ -295,10 +301,42 @@ class HotelEnv(gym.Env):
         if terminated:
             ideal  = _ideal_revenue(self._history, self.capacity, self.customer_types)
             actual = self._episode_revenue
-            info["ideal_revenue"] = ideal
-            info["regret"]        = ideal - actual
-            info["regret_pct"]    = (
-                100.0 * (ideal - actual) / ideal if ideal > 0 else 0.0
+            total_regret = ideal - actual
+
+            # ── Regret decomposition ──────────────────────────────────────
+            # Walk history and attribute each missed revenue dollar to either:
+            #   forced_regret    : agent said Accept but hotel was full
+            #   voluntary_regret : agent said Reject (action=0)
+            # Both are measured as the raw revenue that *would* have been
+            # earned if the customer had been accepted.  This is a lower
+            # bound on the true counterfactual (accepting them might have
+            # blocked a later better customer) but gives a clean, honest
+            # attribution of where the losses came from step-by-step.
+            forced_rev_lost   = 0.0
+            voluntary_rev_lost= 0.0
+            for rec in self._history:
+                if rec.reward == 0.0:           # something was rejected
+                    ctype_rec = self.customer_types[rec.customer_type]
+                    missed    = ctype_rec.reward_per_room * rec.request
+                    if rec.action == 1:         # tried to accept, no room
+                        forced_rev_lost    += missed
+                    else:                       # deliberate reject
+                        voluntary_rev_lost += missed
+
+            info["ideal_revenue"]          = ideal
+            info["regret"]                 = total_regret
+            info["regret_pct"]             = (
+                100.0 * total_regret / ideal if ideal > 0 else 0.0
+            )
+            info["forced_rev_lost"]        = forced_rev_lost
+            info["voluntary_rev_lost"]     = voluntary_rev_lost
+            # Fraction of total rejected revenue attributable to each cause
+            total_lost = forced_rev_lost + voluntary_rev_lost
+            info["forced_rev_lost_pct"]    = (
+                100.0 * forced_rev_lost    / total_lost if total_lost > 0 else 0.0
+            )
+            info["voluntary_rev_lost_pct"] = (
+                100.0 * voluntary_rev_lost / total_lost if total_lost > 0 else 0.0
             )
 
         if self.render_mode == "human" and not terminated:
@@ -451,6 +489,8 @@ class HotelEnv(gym.Env):
             ),
             "accepted"             : self._accepted,
             "rejected"             : self._rejected,
+            "forced_reject"        : self._forced_reject,
+            "voluntary_reject"     : self._voluntary_reject,
             "current_customer"     : ctype.name,
             "requested_rooms"      : self._request,
             "reward_per_room"      : ctype.reward_per_room,

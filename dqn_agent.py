@@ -450,9 +450,15 @@ class DQNAgent:
         self.target.load_state_dict(self.online.state_dict())
 
     def save(self, path: str = "dqn_hotel.pt") -> None:
-        torch.save({"online": self.online.state_dict(),
-                    "target": self.target.state_dict(),
-                    "epsilon": self.epsilon, "steps": self.steps}, path)
+        torch.save({
+            "online"    : self.online.state_dict(),
+            "target"    : self.target.state_dict(),
+            "optimizer" : self.optimizer.state_dict(),
+            "scheduler" : self.scheduler.state_dict(),
+            "epsilon"   : self.epsilon,
+            "steps"     : self.steps,
+            "episode"   : self._episode,
+        }, path)
         print(f"  [ckpt] saved → {path}")
 
     def save_best(self, eval_revenue: float, path: str = "dqn_hotel_best.pt") -> bool:
@@ -460,10 +466,16 @@ class DQNAgent:
         if eval_revenue > self._best_eval_revenue:
             self._best_eval_revenue = eval_revenue
             self._best_path         = path
-            torch.save({"online": self.online.state_dict(),
-                        "target": self.target.state_dict(),
-                        "epsilon": self.epsilon, "steps": self.steps,
-                        "best_revenue": eval_revenue}, path)
+            torch.save({
+                "online"       : self.online.state_dict(),
+                "target"       : self.target.state_dict(),
+                "optimizer"    : self.optimizer.state_dict(),
+                "scheduler"    : self.scheduler.state_dict(),
+                "epsilon"      : self.epsilon,
+                "steps"        : self.steps,
+                "episode"      : self._episode,
+                "best_revenue" : eval_revenue,
+            }, path)
             return True
         return False
 
@@ -473,11 +485,26 @@ class DQNAgent:
         print(f"  [best] best eval revenue: ${self._best_eval_revenue:.1f}")
 
     def load(self, path: str = "dqn_hotel.pt") -> None:
+        """
+        Load a checkpoint and fully restore training state.
+
+        Restores network weights, optimizer moments, scheduler position,
+        epsilon, and step/episode counters — so resumed training continues
+        exactly where it left off with no discontinuities in LR or ε.
+        """
         ckpt = torch.load(path, map_location=self.device)
         self.online.load_state_dict(ckpt["online"])
         self.target.load_state_dict(ckpt["target"])
-        self.epsilon, self.steps = ckpt["epsilon"], ckpt["steps"]
-        print(f"  [ckpt] loaded ← {path}  ε={self.epsilon:.3f}")
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.scheduler.load_state_dict(ckpt["scheduler"])
+        self.epsilon    = ckpt["epsilon"]
+        self.steps      = ckpt["steps"]
+        self._episode   = ckpt.get("episode", 0)
+        print(f"  [ckpt] loaded ← {path}"
+              f"  ε={self.epsilon:.3f}"
+              f"  steps={self.steps}"
+              f"  episode={self._episode}"
+              f"  lr={self.optimizer.param_groups[0]['lr']:.2e}")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -496,11 +523,29 @@ class TrainLog:
 
 
 def train(
-    agent    : DQNAgent,
-    env      : HotelEnv,
-    hp       : HyperParams = HP,
-    eval_env : Optional[HotelEnv] = None,
+    agent       : DQNAgent,
+    env         : HotelEnv,
+    hp          : HyperParams = HP,
+    eval_env    : Optional[HotelEnv] = None,
+    resume_from : Optional[str] = None,   # path to checkpoint to resume from
 ) -> List[TrainLog]:
+    """
+    Full DQN training loop.  Pass resume_from="dqn_hotel.pt" to continue
+    training on top of an existing checkpoint.
+
+    On resume:
+      - Network weights, optimizer moments, and scheduler position are all
+        restored so LR and ε continue smoothly — no cold-restart discontinuity.
+      - The episode counter is offset so ε decay and LR cosine schedule
+        treat the resumed episode as episode (start_episode + 1), not 1.
+      - n_episodes is interpreted as *additional* episodes to run, not total.
+    """
+    if resume_from is not None:
+        agent.load(resume_from)
+        print(f"  Resuming from ep {agent._episode} — "
+              f"running {hp.n_episodes} more episodes\n")
+
+    start_episode = agent._episode
     if eval_env is None:
         eval_env = HotelEnv(
             capacity       = env.base_capacity,
@@ -527,7 +572,8 @@ def train(
     losses: collections.deque       = collections.deque(maxlen=500)
 
     for ep in range(1, hp.n_episodes + 1):
-        agent._episode = ep
+        abs_ep = start_episode + ep       # absolute episode number across all runs
+        agent._episode = abs_ep
         agent._update_epsilon()
 
         obs, info = env.reset()
@@ -564,7 +610,7 @@ def train(
             avg_loss = float(np.mean(losses)) if losses else 0.0
             is_best  = agent.save_best(stats["avg_revenue"])
             logs.append(TrainLog(
-                episode      = ep,
+                episode      = abs_ep,
                 epsilon      = agent.epsilon,
                 eval_revenue = stats["avg_revenue"],
                 eval_ideal   = stats["avg_ideal"],
@@ -573,7 +619,7 @@ def train(
                 utilisation  = stats["avg_utilisation"],
             ))
             print(
-                f"  {ep:>8}  {agent.epsilon:>6.3f}"
+                f"  {abs_ep:>8}  {agent.epsilon:>6.3f}"
                 f"  ${stats['avg_revenue']:>9.1f}"
                 f"  ${stats['avg_ideal']:>9.1f}"
                 f"  {stats['avg_regret_pct']:>7.1f}%"
@@ -768,8 +814,114 @@ def compare_agents(dqn_agent: DQNAgent, env: HotelEnv, n_episodes: int = 500):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Regret decomposition: forced vs voluntary
 # ────────────────────────────────────────────────────────────────────────────
+
+def regret_breakdown(agents_dict: Dict, env: HotelEnv, n_episodes: int = 500):
+    """
+    For each agent, decompose rejected revenue into two buckets:
+
+    Forced regret   — agent said Accept but the hotel was physically full.
+                      This is unavoidable at decision time; it reflects
+                      earlier choices that filled the hotel too fast with
+                      low-value guests.
+
+    Voluntary regret — agent said Reject (action=0).
+                      This is a deliberate strategic choice.  It's correct
+                      when saving rooms for better guests, and wrong when
+                      the hotel eventually ends the episode with free rooms.
+
+    Both are measured in raw dollars of revenue that *would* have been
+    earned had that customer been accepted.  Note: this is a gross
+    attribution — it doesn't account for the counterfactual chain (accepting
+    a Budget guest blocks a Premium guest two steps later).  Use it to
+    understand *where* losses are happening, not as an exact decomposition
+    of the DP regret.
+
+    Also reports:
+      spilled_voluntary  — voluntary rejects where the hotel ended the
+                           episode with rooms still free.  These are the
+                           clearest mistakes: the agent rejected someone,
+                           and those rooms were never used anyway.
+    """
+    cw   = 17
+    cols = ["Agent", "Revenue", "Forced $lost", "Forced %", "Voluntary $lost",
+            "Vol %", "Wasted vol $"]
+    sep  = "=" * (cw * len(cols))
+
+    print(f"\n{sep}")
+    print(f"  Regret decomposition  |  {n_episodes} episodes  |  scale={env.scale}")
+    print(f"  Forced   = tried to accept, hotel was full")
+    print(f"  Voluntary= chose to reject (action=0)")
+    print(f"  Wasted   = voluntary rejects where rooms were unused at end of episode")
+    print(sep)
+    print("  " + "".join(f"{c:<{cw}}" for c in cols))
+    print("  " + "-" * (cw * len(cols)))
+
+    for name, agent_fn in agents_dict.items():
+        ep_revenues, ep_forced, ep_vol, ep_spilled = [], [], [], []
+
+        for _ in range(n_episodes):
+            obs, info = env.reset()
+            done = False
+
+            # Track voluntary rejects this episode to identify wasted ones
+            vol_rejected_rev = 0.0
+
+            while not done:
+                action = agent_fn(obs, info)
+                # Before stepping: if this will be a voluntary reject, record value
+                if action == 0:
+                    pot = info["reward_per_room"] * info["requested_rooms"]
+                else:
+                    pot = 0.0
+
+                obs, _, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+
+                if action == 0:
+                    vol_rejected_rev += pot
+
+            ep_revenues.append(info["episode_revenue"])
+            ep_forced.append(info.get("forced_rev_lost", 0.0))
+            ep_vol.append(info.get("voluntary_rev_lost", 0.0))
+
+            # Wasted voluntary: rooms were left free at end → those rejects hurt us
+            rooms_left = env.capacity - info["rooms_occupied"]
+            if rooms_left > 0:
+                # Approximate: all voluntary rejected revenue is "wasted"
+                # when there were rooms remaining (conservative — overestimates
+                # slightly since some rooms might have been saved for later guests
+                # who also didn't arrive).
+                ep_spilled.append(info.get("voluntary_rev_lost", 0.0))
+            else:
+                ep_spilled.append(0.0)
+
+        avg_rev     = np.mean(ep_revenues)
+        avg_forced  = np.mean(ep_forced)
+        avg_vol     = np.mean(ep_vol)
+        avg_spilled = np.mean(ep_spilled)
+        total_lost  = avg_forced + avg_vol
+        forced_pct  = 100 * avg_forced / total_lost if total_lost > 0 else 0
+        vol_pct     = 100 * avg_vol    / total_lost if total_lost > 0 else 0
+
+        print(
+            f"  {name:<{cw}}"
+            f"${avg_rev:<{cw-1}.1f}"
+            f"${avg_forced:<{cw-1}.1f}"
+            f"{forced_pct:<{cw}.1f}%"
+            f"${avg_vol:<{cw-1}.1f}"
+            f"{vol_pct:<{cw}.1f}%"
+            f"${avg_spilled:<{cw-1}.1f}"
+        )
+
+    print(sep)
+    print(
+        "  Interpretation:\n"
+        "  • High Forced $  → agent accepts too eagerly early, hotel fills up, later guests spill\n"
+        "  • High Voluntary $, low Wasted $ → good strategic rejects (saved for better guests)\n"
+        "  • High Voluntary $, high Wasted $ → bad rejects (rejected guests, rooms sat empty)\n"
+    )
 
 if __name__ == "__main__":
 
@@ -813,6 +965,26 @@ if __name__ == "__main__":
     logs  = train(agent, train_env, hp=hp, eval_env=eval_env)
     agent.save("dqn_hotel.pt")
 
+    # ── To resume training on top of saved weights, do this instead: ─────
+    #
+    #   agent = DQNAgent(train_env, hp=hp, device="cpu", n_episodes=hp.n_episodes)
+    #   logs  = train(agent, train_env, hp=hp, eval_env=eval_env,
+    #                 resume_from="dqn_hotel.pt")
+    #   agent.save("dqn_hotel.pt")
+    #
+    # ε and LR will continue exactly from where they left off.
+    # Set hp.n_episodes to however many *additional* episodes you want.
+    # ─────────────────────────────────────────────────────────────────────
+
     evaluate(agent, eval_env, n_episodes=500, silent=False)
     compare_agents(agent, eval_env, n_episodes=500)
     policy_summary(agent, eval_env, n_episodes=500)
+
+    # Regret decomposition: forced vs voluntary
+    agents_to_compare = {
+        "DQN (trained)"  : lambda obs, info: agent.act(obs, info, greedy=True),
+        "Greedy"         : GreedyAgent(),
+        "Threshold(0.3)" : ThresholdAgent(0.3),
+        "Random"         : RandomAgent(),
+    }
+    regret_breakdown(agents_to_compare, eval_env, n_episodes=500) 
