@@ -60,6 +60,16 @@ DEFAULT_CUSTOMER_TYPES: List[CustomerType] = [
     CustomerType("Group",    min_rooms=3, max_rooms=6, reward_per_room=90.0,  arrival_prob=0.10),
 ]
 
+# Tighter environment: capacity pressure forces real accept/reject tradeoffs.
+# Expected rooms demanded per step ≈ 2.5; with capacity=20 and horizon=50,
+# ~125 rooms are demanded vs 20 available — agent MUST reject low-value guests.
+TIGHT_CUSTOMER_TYPES: List[CustomerType] = [
+    CustomerType("Budget",   min_rooms=1, max_rooms=2, reward_per_room=80.0,  arrival_prob=0.40),
+    CustomerType("Standard", min_rooms=1, max_rooms=3, reward_per_room=120.0, arrival_prob=0.35),
+    CustomerType("Premium",  min_rooms=2, max_rooms=4, reward_per_room=200.0, arrival_prob=0.15),
+    CustomerType("Group",    min_rooms=4, max_rooms=8, reward_per_room=90.0,  arrival_prob=0.10),
+]
+
 
 # ---------------------------------------------------------------------------
 # Step record – used by the backtracking buffer
@@ -92,32 +102,50 @@ def _ideal_revenue(
     customer_types: List[CustomerType],
 ) -> float:
     """
-    Replay the exact same arrival sequence.
-    Greedily accept customers in descending $/room order (offline optimum
-    for a single-resource knapsack with unit-time arrivals).
+    Compute the true sequential-optimal revenue on the realised arrival sequence
+    using backward induction (DP).
+
+    Why not the knapsack oracle?
+    The knapsack oracle re-orders arrivals by $/room and fills greedily — but
+    that is *not* achievable online.  A real agent must decide at t=1 without
+    knowing who arrives at t=2..T.  The knapsack bound is therefore unachievably
+    optimistic and produces inflated regret numbers.
+
+    The DP oracle IS achievable: it knows the full sequence in hindsight and
+    makes the optimal accept/reject at each time-step in order.  This is the
+    tightest valid upper bound for any online policy on this realisation.
+
+    DP formulation
+    --------------
+    V[t][r] = max revenue collectible from step t onward given r rooms remaining.
+    Base:     V[T][r] = 0 for all r.
+    Recurse:  V[t][r] = max(
+                  reject:  V[t+1][r],
+                  accept:  reward_t + V[t+1][r - req_t]   if req_t <= r
+              )
+    Answer:   V[0][capacity]
     """
-    # De-duplicate by time_step: if the agent backtracked and re-played a
-    # slot, keep only the last version seen for that time-step.
+    # De-duplicate: if agent backtracked, keep last action per time-step
     seen: Dict[int, StepRecord] = {}
     for rec in history:
         seen[rec.time_step] = rec
 
-    arrivals_by_value = sorted(
-        seen.values(),
-        key=lambda r: (
-            -customer_types[r.customer_type].reward_per_room,  # higher $ first
-            r.request,                                          # fewer rooms break tie
-        ),
-    )
+    T        = len(seen)
+    arrivals = [seen[t] for t in sorted(seen)]   # ordered t=0,1,...,T-1
 
-    remaining = capacity
-    total = 0.0
-    for rec in arrivals_by_value:
-        ctype = customer_types[rec.customer_type]
-        if rec.request <= remaining:
-            total += ctype.reward_per_room * rec.request
-            remaining -= rec.request
-    return total
+    # V[r] = best revenue from current step onward with r rooms left
+    V = np.zeros(capacity + 1, dtype=np.float64)
+
+    for rec in reversed(arrivals):
+        ctype   = customer_types[rec.customer_type]
+        reward  = ctype.reward_per_room * rec.request
+        req     = rec.request
+        V_new   = V.copy()                        # reject branch (always available)
+        for r in range(req, capacity + 1):        # accept branch
+            V_new[r] = max(V_new[r], reward + V[r - req])
+        V = V_new
+
+    return float(V[capacity])
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +443,7 @@ class HotelEnv(gym.Env):
         return {
             "rooms_occupied"       : self._rooms_occupied,
             "rooms_available"      : self.capacity - self._rooms_occupied,
+            "utilisation_rate"     : self._rooms_occupied / self.capacity,
             "time_step"            : self._time_step,
             "episode_revenue"      : self._episode_revenue,
             "revenue_per_room_sold": (
