@@ -492,6 +492,7 @@ class HotelEnv(gym.Env):
             "forced_reject"        : self._forced_reject,
             "voluntary_reject"     : self._voluntary_reject,
             "current_customer"     : ctype.name,
+            "current_customer_idx" : self._customer_type,   # fix B5 (was monkey-patched)
             "requested_rooms"      : self._request,
             "reward_per_room"      : ctype.reward_per_room,
             "scale"                : self.scale,

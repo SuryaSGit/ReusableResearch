@@ -1,0 +1,18 @@
+# Trained-model checkpoints — too large and not source-of-truth
+*.pt
+
+# Byte-compiled / caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Experiment outputs — regenerable from source
+results/
+comparison.png
+
+# Editor / IDE noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
