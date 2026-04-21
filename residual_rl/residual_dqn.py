@@ -220,6 +220,53 @@ class ResidualDQNAgent:
             self._recent_losses = self._recent_losses[-200:]
         return loss_f
 
+    # ------ diagnostics ------
+
+    def q_magnitudes(
+        self,
+        probe_obs:   np.ndarray,
+        probe_infos: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        """
+        Report average |Q_theta|, |Q_CHT|, |Q_final| over a *fixed* probe set.
+
+        The probe set is sampled ONCE at experiment start (by the trainer)
+        and reused across all arms/log-points so magnitudes are directly
+        comparable.
+
+        Returns keys:
+            q_theta              - mean |Q_theta| over probe states+actions
+            q_cht                - mean |Q_CHT|   over probe states+actions
+            q_final              - mean |Q_theta + Q_CHT|  (or |Q_theta| when
+                                   arm.use_residual_q is False — Q_final is
+                                   what the agent actually consumes)
+            q_theta_over_final   - ratio |Q_theta| / |Q_final| (passenger check)
+        """
+        if probe_obs.shape[0] == 0:
+            return {"q_theta": 0.0, "q_cht": 0.0, "q_final": 0.0,
+                    "q_theta_over_final": 0.0}
+
+        with torch.no_grad():
+            t = torch.tensor(probe_obs, dtype=torch.float32, device=self.device)
+            q_theta = self.online(t)                                 # (B, A)
+            q_theta_mag = float(q_theta.abs().mean().item())
+
+        q_cht_t = self.prior.q_cht_batch(probe_infos).to(self.device)  # (B, A)
+        q_cht_mag = float(q_cht_t.abs().mean().item())
+
+        if self.arm.use_residual_q:
+            q_final = q_theta + q_cht_t
+        else:
+            q_final = q_theta
+        q_final_mag = float(q_final.abs().mean().item())
+        ratio = q_theta_mag / q_final_mag if q_final_mag > 1e-8 else 0.0
+        return {
+            "q_theta":             q_theta_mag,
+            "q_cht":               q_cht_mag,
+            "q_final":             q_final_mag,
+            "q_theta_over_final":  ratio,
+        }
+
     # ------ episode boundary hooks ------
 
     def sync_target(self) -> None:
