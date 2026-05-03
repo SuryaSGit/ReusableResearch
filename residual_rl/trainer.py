@@ -137,7 +137,7 @@ def build_probe_set(
         if hasattr(prior, "update_allocation"):
             prior.update_allocation(info_snap, a)
         _, _, term, trunc, info = probe_env.step(a)
-        done = term or trunc or info.get("current_type", 0) is None and "state" in info
+        done = term or trunc or (info.get("current_type") is None and "state" in info)
         steps_taken += 1
         if done:
             # reset to keep sampling if we still need states

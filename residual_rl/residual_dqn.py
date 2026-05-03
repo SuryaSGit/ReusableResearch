@@ -214,6 +214,7 @@ class ResidualDQNAgent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.online.parameters(), max_norm=self.hp.grad_clip)
         self.optimizer.step()
+        self._steps += 1
         loss_f = float(loss.item())
         self._recent_losses.append(loss_f)
         if len(self._recent_losses) > 200:
